@@ -11,7 +11,11 @@ const DESKTOP = [
   { to: "/impressum", label: "Impressum" },
 ] as const;
 
-const MOBILE = [...DESKTOP, { to: "/datenschutz", label: "Datenschutz" }] as const;
+const MOBILE = [
+  ...DESKTOP,
+  { to: "/datenschutz", label: "Datenschutz" },
+  { to: "/agb", label: "Nutzungsbedingungen" },
+] as const;
 
 const navBase = "inline-flex min-h-12 items-center justify-center px-3 text-sm transition-colors";
 
