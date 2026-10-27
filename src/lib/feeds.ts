@@ -7,6 +7,7 @@ import {
   type NewsPayload,
   type Quote,
 } from "@/lib/market";
+import { selectPublishedAt, shortTeaser } from "@/lib/news-dates";
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
@@ -348,13 +349,17 @@ function parseRss(xml: string, source: string): Draft[] {
   for (const block of blocks) {
     const title = cleanText(firstTag(block, "title"));
     const url = safeHttp(firstTag(block, "link"));
-    const publishedAt = parseDate(firstTag(block, "pubDate") || firstTag(block, "dc:date"));
+    const publishedAt = selectPublishedAt({
+      pubDate: firstTag(block, "pubDate"),
+      dcDate: firstTag(block, "dc:date"),
+      now: Date.now(),
+    });
     if (!title || !url || !publishedAt) continue;
     const id = firstTag(block, "guid") || url;
     items.push({
       id: `${source}:${id}`.slice(0, 240),
       title: truncate(title, 180),
-      teaser: truncate(cleanText(firstTag(block, "description")), 320),
+      teaser: shortTeaser(cleanText(firstTag(block, "description"))),
       url,
       source,
       publishedAt,
@@ -388,14 +393,6 @@ function decode(value: string): string {
     .replace(/&apos;/g, "'")
     .replace(/&#(\d+);/g, (_, code: string) => String.fromCodePoint(Number(code)))
     .replace(/&#x([0-9a-f]+);/gi, (_, code: string) => String.fromCodePoint(parseInt(code, 16)));
-}
-
-function parseDate(value: string): string | null {
-  const text = cleanText(value);
-  if (!text) return null;
-  const time = Date.parse(text);
-  if (Number.isNaN(time)) return null;
-  return new Date(time).toISOString();
 }
 
 function safeHttp(value: string): string | null {
