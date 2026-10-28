@@ -1,3 +1,11 @@
+import { createStaleWhileRevalidate, readUpstream } from "@/lib/upstream-cache";
+import {
+  BOARD_FRESH_MS,
+  NEWS_BUDGET_MS,
+  NEWS_FRESH_MS,
+  REVALIDATE_WAIT_MS,
+  UPSTREAM_TIMEOUT_MS,
+} from "@/lib/upstream-budget";
 import { createServerFn } from "@tanstack/react-start";
 import {
   INSTRUMENTS,
@@ -10,44 +18,85 @@ import {
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
-type Cache<T> = { at: number; value: T };
-
-let boardCache: Cache<BoardPayload> | null = null;
-let newsCache: Cache<NewsPayload> | null = null;
-
 const FEEDS: Array<{ source: string; url: string }> = [
   { source: "tagesschau", url: "https://www.tagesschau.de/wirtschaft/index~rss2.xml" },
   { source: "n-tv", url: "https://www.n-tv.de/wirtschaft/rss" },
   { source: "DER SPIEGEL", url: "https://www.spiegel.de/wirtschaft/index.rss" },
 ];
 
+const readBoard = createStaleWhileRevalidate<BoardPayload>({
+  freshMs: BOARD_FRESH_MS,
+  waitForFreshMs: REVALIDATE_WAIT_MS,
+  loadTimeoutMs: UPSTREAM_TIMEOUT_MS + 750,
+  isFresh: (value) => value.ok && value.quotes.length > 0,
+  load: () => buildBoard(),
+});
+
+const readNews = createStaleWhileRevalidate<NewsPayload>({
+  freshMs: NEWS_FRESH_MS,
+  waitForFreshMs: REVALIDATE_WAIT_MS,
+  loadTimeoutMs: NEWS_BUDGET_MS + 750,
+  isFresh: (value) => value.ok && value.items.length > 0,
+  load: () => buildNews(),
+});
+
 export const loadBoard = createServerFn({ method: "GET" }).handler(async (): Promise<BoardPayload> => {
-  const now = Date.now();
-  if (boardCache && now - boardCache.at < 30_000) return boardCache.value;
-  const value = await buildBoard();
-  if (value.ok) boardCache = { at: now, value };
-  return value;
+  try {
+    return await readBoard();
+  } catch {
+    return failureBoard();
+  }
 });
 
 export const loadNews = createServerFn({ method: "GET" }).handler(async (): Promise<NewsPayload> => {
-  const now = Date.now();
-  if (newsCache && now - newsCache.at < 180_000) return newsCache.value;
-  const value = await buildNews();
-  if (value.ok) newsCache = { at: now, value };
-  return value;
+  try {
+    return await readNews();
+  } catch {
+    return failureNews();
+  }
 });
 
+function failureBoard(): BoardPayload {
+  return {
+    ok: false,
+    asOf: new Date().toISOString(),
+    message: "Die Kursquelle ist gerade nicht erreichbar. Bitte gleich noch einmal aktualisieren.",
+    quotes: [],
+  };
+}
+
+function failureNews(): NewsPayload {
+  return {
+    ok: false,
+    asOf: new Date().toISOString(),
+    message: "Nachrichten sind gerade nicht erreichbar.",
+    items: [],
+  };
+}
+
 async function buildBoard(): Promise<BoardPayload> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  try {
+    return await assembleBoard(controller.signal);
+  } catch {
+    return failureBoard();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function assembleBoard(signal: AbortSignal): Promise<BoardPayload> {
   const asOf = new Date().toISOString();
   const batches = chunk(INSTRUMENTS, 6);
-  const settled = await Promise.all(batches.map((batch) => fetchSpark(batch)));
+  const settled = await Promise.all(batches.map((batch) => fetchSpark(batch, signal)));
   const bySymbol = new Map<string, Quote>();
   for (const list of settled) {
     for (const quote of list) bySymbol.set(quote.symbol, quote);
   }
   const missing = INSTRUMENTS.filter((item) => !bySymbol.has(item.symbol));
-  if (missing.length > 0) {
-    const extra = await Promise.all(missing.map((item) => fetchChart(item)));
+  if (missing.length > 0 && !signal.aborted) {
+    const extra = await Promise.all(missing.map((item) => fetchChart(item, signal)));
     for (const quote of extra) {
       if (quote) bySymbol.set(quote.symbol, quote);
     }
@@ -56,27 +105,21 @@ async function buildBoard(): Promise<BoardPayload> {
     const quote = bySymbol.get(item.symbol);
     return quote ? [quote] : [];
   });
-  if (quotes.length === 0) {
-    return {
-      ok: false,
-      asOf,
-      message: "Die Kursquelle ist gerade nicht erreichbar. Bitte gleich noch einmal aktualisieren.",
-      quotes: [],
-    };
-  }
+  if (quotes.length === 0) return failureBoard();
   return { ok: true, asOf, message: null, quotes };
 }
 
-async function fetchSpark(batch: Instrument[]): Promise<Quote[]> {
+async function fetchSpark(batch: Instrument[], signal: AbortSignal): Promise<Quote[]> {
   const symbols = batch.map((item) => encodeURIComponent(item.symbol)).join(",");
   const url = `https://query1.finance.yahoo.com/v7/finance/spark?symbols=${symbols}&range=1d&interval=5m`;
   try {
-    const response = await fetch(url, {
-      headers: { "User-Agent": UA, Accept: "application/json" },
-      signal: AbortSignal.timeout(12_000),
-    });
+    const response = await readUpstream(
+      url,
+      { headers: { "User-Agent": UA, Accept: "application/json" }, signal },
+      UPSTREAM_TIMEOUT_MS,
+    );
     if (!response.ok) return [];
-    const data = (await response.json()) as YahooSpark;
+    const data = JSON.parse(response.text) as YahooSpark;
     const rows = data.spark?.result ?? [];
     const quotes: Quote[] = [];
     for (const row of rows) {
@@ -127,15 +170,16 @@ async function fetchSpark(batch: Instrument[]): Promise<Quote[]> {
   }
 }
 
-async function fetchChart(spec: Instrument): Promise<Quote | null> {
+async function fetchChart(spec: Instrument, signal: AbortSignal): Promise<Quote | null> {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(spec.symbol)}?interval=5m&range=1d&includePrePost=false`;
   try {
-    const response = await fetch(url, {
-      headers: { "User-Agent": UA, Accept: "application/json" },
-      signal: AbortSignal.timeout(12_000),
-    });
+    const response = await readUpstream(
+      url,
+      { headers: { "User-Agent": UA, Accept: "application/json" }, signal },
+      UPSTREAM_TIMEOUT_MS,
+    );
     if (!response.ok) return null;
-    const data = (await response.json()) as {
+    const data = JSON.parse(response.text) as {
       chart?: {
         result?: Array<{
           timestamp?: number[];
@@ -193,13 +237,23 @@ async function fetchChart(spec: Instrument): Promise<Quote | null> {
 }
 
 async function buildNews(): Promise<NewsPayload> {
-  const asOf = new Date().toISOString();
-  const settled = await Promise.all(FEEDS.map((feed) => readFeed(feed.source, feed.url)));
-  const merged = mergeDuplicates(settled.flat()).slice(0, 8);
-  if (merged.length === 0) {
-    return { ok: false, asOf, message: "Nachrichten sind gerade nicht erreichbar.", items: [] };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), NEWS_BUDGET_MS);
+  try {
+    return await assembleNews(controller.signal);
+  } catch {
+    return failureNews();
+  } finally {
+    clearTimeout(timer);
   }
-  const items = await applyOwnSummaries(merged);
+}
+
+async function assembleNews(signal: AbortSignal): Promise<NewsPayload> {
+  const asOf = new Date().toISOString();
+  const settled = await Promise.all(FEEDS.map((feed) => readFeed(feed.source, feed.url, signal)));
+  const merged = mergeDuplicates(settled.flat()).slice(0, 8);
+  if (merged.length === 0) return failureNews();
+  const items = await applyOwnSummaries(merged, signal);
   return { ok: true, asOf, message: null, items };
 }
 
@@ -263,7 +317,7 @@ function mergeDuplicates(items: Draft[]): Draft[] {
 
 const summaryCache = new Map<string, string>();
 
-async function applyOwnSummaries(items: Draft[]): Promise<NewsItem[]> {
+async function applyOwnSummaries(items: Draft[], signal: AbortSignal): Promise<NewsItem[]> {
   const apiKey = process.env.XAI_API_KEY;
   const pending = items.filter((item) => !summaryCache.has(item.url));
   if (apiKey && pending.length > 0) {
@@ -271,26 +325,30 @@ async function applyOwnSummaries(items: Draft[]): Promise<NewsItem[]> {
       const lines = pending
         .map((item, index) => `${index + 1}. ${item.source}: ${item.title}. Stoff: ${item.teaser.slice(0, 280)}`)
         .join("\n");
-      const response = await fetch("https://api.x.ai/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        signal: AbortSignal.timeout(12_000),
-        body: JSON.stringify({
-          model: "grok-4.5",
-          max_tokens: 1600,
-          temperature: 0.2,
-          messages: [
-            {
-              role: "system",
-              content:
-                "Fasse jede Meldung in 1–2 eigenen deutschen Sätzen sachlich zusammen, max. 220 Zeichen, keine wörtlichen Zitate, keine Wertung, keine Anlageempfehlung. Genau eine Zeile je Meldung: Nummer|||Text",
-            },
-            { role: "user", content: lines },
-          ],
-        }),
-      });
+      const response = await readUpstream(
+        "https://api.x.ai/v1/chat/completions",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+          signal,
+          body: JSON.stringify({
+            model: "grok-4.5",
+            max_tokens: 1600,
+            temperature: 0.2,
+            messages: [
+              {
+                role: "system",
+                content:
+                  "Fasse jede Meldung in 1–2 eigenen deutschen Sätzen sachlich zusammen, max. 220 Zeichen, keine wörtlichen Zitate, keine Wertung, keine Anlageempfehlung. Genau eine Zeile je Meldung: Nummer|||Text",
+              },
+              { role: "user", content: lines },
+            ],
+          }),
+        },
+        UPSTREAM_TIMEOUT_MS,
+      );
       if (response.ok) {
-        const body = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+        const body = JSON.parse(response.text) as { choices?: Array<{ message?: { content?: string } }> };
         const text = body.choices?.[0]?.message?.content ?? "";
         const rows = text.split("\n").flatMap((row) => {
           const strict = row.match(/(\d+)\s*\|\|\|\s*(.+)/);
@@ -328,15 +386,15 @@ function clip(value: string, max: number): string {
   return `${(space > 40 ? cut.slice(0, space) : cut).trimEnd()}…`;
 }
 
-async function readFeed(source: string, url: string): Promise<Draft[]> {
+async function readFeed(source: string, url: string, signal: AbortSignal): Promise<Draft[]> {
   try {
-    const response = await fetch(url, {
-      headers: { "User-Agent": UA, Accept: "application/rss+xml, application/xml, text/xml" },
-      signal: AbortSignal.timeout(12_000),
-    });
+    const response = await readUpstream(
+      url,
+      { headers: { "User-Agent": UA, Accept: "application/rss+xml, application/xml, text/xml" }, signal },
+      UPSTREAM_TIMEOUT_MS,
+    );
     if (!response.ok) return [];
-    const xml = await response.text();
-    return parseRss(xml, source);
+    return parseRss(response.text, source);
   } catch {
     return [];
   }
